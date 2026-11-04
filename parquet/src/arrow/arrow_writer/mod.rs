@@ -6002,6 +6002,38 @@ mod tests {
     }
 
     #[test]
+    fn test_dictionary_change_across_batches() {
+        // Both batches use keys 0 and 1, but with different dictionary values
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "x",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            false,
+        )]));
+        let batch = |a: &str, b: &str| {
+            let keys = Int32Array::from(vec![0, 1, 0, 1]);
+            let values = Arc::new(StringArray::from(vec![a, b]));
+            let dict = DictionaryArray::<Int32Type>::try_new(keys, values).unwrap();
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(dict)]).unwrap()
+        };
+
+        let mut buf = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buf, schema.clone(), None).unwrap();
+        writer.write(&batch("cat", "dog")).unwrap();
+        writer.write(&batch("fish", "cat")).unwrap();
+        let metadata = writer.close().unwrap();
+
+        let mut reader = ParquetRecordBatchReader::try_new(Bytes::from(buf), 8).unwrap();
+        let read = reader.next().unwrap().unwrap();
+        let expected: DictionaryArray<Int32Type> =
+            ["cat", "dog", "cat", "dog", "fish", "cat", "fish", "cat"]
+                .into_iter()
+                .collect();
+        assert_eq!(read.column(0).as_ref(), &expected as &dyn Array);
+        let column = metadata.row_group(0).column(0);
+        assert_eq!(column.unencoded_byte_array_data_bytes(), Some(26));
+    }
+
+    #[test]
     fn ree_struct_with_ree_child() {
         // Struct with a REE string field and a REE int field — confirms
         // recursion visits every child and each collapses to the right leaf type.

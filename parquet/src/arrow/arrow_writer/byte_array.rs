@@ -33,13 +33,15 @@ use crate::geospatial::statistics::GeospatialStatistics;
 use crate::schema::types::ColumnDescPtr;
 use crate::util::bit_util::num_required_bits;
 use crate::util::prefix::common_prefix_length;
-use arrow_array::types::ByteArrayType;
+use arrow_array::types::{ArrowDictionaryKeyType, ByteArrayType, ByteViewType};
 use arrow_array::{
-    Array, ArrayAccessor, BinaryArray, BinaryViewArray, DictionaryArray, FixedSizeBinaryArray,
-    GenericByteArray, LargeBinaryArray, LargeStringArray, StringArray, StringViewArray,
+    Array, ArrayAccessor, ArrayRef, BinaryArray, BinaryViewArray, DictionaryArray,
+    FixedSizeBinaryArray, GenericByteArray, GenericByteViewArray, LargeBinaryArray,
+    LargeStringArray, StringArray, StringViewArray, TypedDictionaryArray,
 };
 use arrow_buffer::{ArrowNativeType, Buffer};
 use arrow_schema::DataType;
+use std::sync::Arc;
 
 macro_rules! downcast_dict_impl {
     ($array:ident, $key:ident, $val:ident, $op:expr $(, $arg:expr)*) => {{
@@ -577,6 +579,12 @@ struct DictEncoder {
     interner: ByteArrayInterner,
     indices: Vec<u64>,
     variable_length_bytes: i64,
+    /// For dictionary input: the dictionary values that `dictionary_keys` belongs to. Holding them
+    /// keeps their allocation alive, so a later dictionary cannot match them by address.
+    dictionary: Option<ArrayRef>,
+    /// For dictionary input: the interned id and byte length of each dictionary key, set at first
+    /// use
+    dictionary_keys: Vec<Option<(u64, i64)>>,
 }
 
 impl DictEncoder {
@@ -598,13 +606,71 @@ impl DictEncoder {
         Ok(())
     }
 
+    /// Encode dictionary `values` to the in-progress page, interning each dictionary value once
+    /// instead of once per row
+    fn encode_dictionary<'a, K, V>(
+        &mut self,
+        values: TypedDictionaryArray<'a, K, V>,
+        indices: impl ExactSizeIterator<Item = usize>,
+    ) -> Result<()>
+    where
+        K: ArrowDictionaryKeyType,
+        V: Sync + Send,
+        &'a V: ArrayAccessor,
+        <&'a V as ArrayAccessor>::Item: AsRef<[u8]> + Default,
+    {
+        let dictionary_values = values
+            .as_any()
+            .downcast_ref::<DictionaryArray<K>>()
+            .unwrap()
+            .values();
+        let known = self
+            .dictionary
+            .as_ref()
+            .is_some_and(|known| Arc::ptr_eq(known, dictionary_values));
+        if !known {
+            // The key table costs an entry for each dictionary value and a lookup for each row, so
+            // use it only when the array has at least two rows for each dictionary value
+            if dictionary_values.len() > values.len() / 2 {
+                return self.encode(values, indices);
+            }
+            self.dictionary = Some(Arc::clone(dictionary_values));
+            self.dictionary_keys.clear();
+            self.dictionary_keys.resize(dictionary_values.len(), None);
+        }
+
+        self.indices.reserve(indices.len());
+
+        for idx in indices {
+            let key = values.keys().value(idx).as_usize();
+            let (interned, len) = match self.dictionary_keys[key] {
+                Some(entry) => entry,
+                None => {
+                    let value = values.values().value(key);
+                    let entry = (
+                        self.interner.intern(value.as_ref())?,
+                        value.as_ref().len() as i64,
+                    );
+                    self.dictionary_keys[key] = Some(entry);
+                    entry
+                }
+            };
+            self.indices.push(interned);
+            self.variable_length_bytes += len;
+        }
+
+        Ok(())
+    }
+
     fn bit_width(&self) -> u8 {
         let length = self.interner.num_unique_values();
         num_required_bits(length.saturating_sub(1) as u64)
     }
 
     fn estimated_memory_size(&self) -> usize {
-        self.interner.estimated_memory_size() + self.indices.capacity() * std::mem::size_of::<u64>()
+        self.interner.estimated_memory_size()
+            + self.indices.capacity() * std::mem::size_of::<u64>()
+            + self.dictionary_keys.capacity() * std::mem::size_of::<Option<(u64, i64)>>()
     }
 
     fn estimated_data_page_size(&self) -> usize {
@@ -902,12 +968,47 @@ impl ColumnValueEncoder for ByteArrayEncoder {
     }
 }
 
+/// An input array of [`DictEncoder`]
+trait DictEncoderInput: ArrayAccessor + Copy
+where
+    Self::Item: AsRef<[u8]>,
+{
+    /// Encode the values at `indices` to `encoder`
+    fn encode_into(
+        self,
+        encoder: &mut DictEncoder,
+        indices: impl ExactSizeIterator<Item = usize>,
+    ) -> Result<()> {
+        encoder.encode(self, indices)
+    }
+}
+
+impl<T: ByteArrayType> DictEncoderInput for &GenericByteArray<T> {}
+
+impl<T: ByteViewType> DictEncoderInput for &GenericByteViewArray<T> {}
+
+impl<'a, K, V> DictEncoderInput for TypedDictionaryArray<'a, K, V>
+where
+    K: ArrowDictionaryKeyType,
+    V: Sync + Send,
+    &'a V: ArrayAccessor,
+    <&'a V as ArrayAccessor>::Item: AsRef<[u8]> + Default,
+{
+    fn encode_into(
+        self,
+        encoder: &mut DictEncoder,
+        indices: impl ExactSizeIterator<Item = usize>,
+    ) -> Result<()> {
+        encoder.encode_dictionary(self, indices)
+    }
+}
+
 /// Encodes the provided `values` and `indices` to `encoder`
 ///
 /// This is a free function so it can be used with `downcast_op!`
 fn encode<T, I>(values: T, indices: I, encoder: &mut ByteArrayEncoder) -> Result<()>
 where
-    T: ArrayAccessor + Copy,
+    T: ArrayAccessor + DictEncoderInput,
     T::Item: Copy + Ord + AsRef<[u8]>,
     I: ExactSizeIterator<Item = usize> + Clone,
 {
@@ -944,7 +1045,7 @@ where
     // While a dictionary is in use the filter is populated from its distinct values in
     // `flush_dict_page`, so each value is hashed once rather than once per row.
     match &mut encoder.dict_encoder {
-        Some(dict_encoder) => dict_encoder.encode(values, indices),
+        Some(dict_encoder) => values.encode_into(dict_encoder, indices),
         None => {
             if let Some(bloom_filter) = &mut encoder.bloom_filter {
                 for idx in indices.clone() {
